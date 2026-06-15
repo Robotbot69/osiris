@@ -748,6 +748,14 @@ def collect_radar(base_url: str = DEFAULT_BASE_URL, limit: int = 8) -> dict[str,
             "total": gdelt.get("total", len(gdelt_events) if isinstance(gdelt_events, list) else 0),
             "source": gdelt.get("source"),
             "errors": gdelt.get("errors") or [],
+            "partial": bool(gdelt.get("partial")),
+            "fallback": bool(gdelt.get("fallback")),
+            "stale": bool(gdelt.get("stale")),
+            "source_mode": gdelt.get("source_mode"),
+            "upstream_status": gdelt.get("upstream_status") or {},
+            "rate_limit_hits": int(gdelt.get("rate_limit_hits") or 0),
+            "timeout_hits": int(gdelt.get("timeout_hits") or 0),
+            "circuit_open_until": gdelt.get("circuit_open_until"),
         }
         payload["gdelt"] = rank_events(gdelt.get("events", []), limit=limit)
     except Exception as exc:  # noqa: BLE001
@@ -772,6 +780,59 @@ def collect_radar(base_url: str = DEFAULT_BASE_URL, limit: int = 8) -> dict[str,
 
 def _line(label: str, value: Any) -> str:
     return f"- {label}: {value}"
+
+
+def _clip(value: Any, limit: int = 110) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _quality_label(gdelt_meta: dict[str, Any]) -> str:
+    total = int(gdelt_meta.get("total") or 0)
+    if total <= 0:
+        return "GDELT DEGRADED"
+    if gdelt_meta.get("stale"):
+        return "GDELT STALE"
+    if gdelt_meta.get("partial") or gdelt_meta.get("errors") or gdelt_meta.get("fallback"):
+        return "GDELT PARTIAL"
+    return "GDELT OK"
+
+
+def _upstream_summary(status: dict[str, Any]) -> str:
+    if not status:
+        return "нет детализации"
+    counts: dict[str, int] = {}
+    for value in status.values():
+        key = str(value or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    order = ["ok", "rate_limited", "timeout", "error", "skipped_circuit", "skipped"]
+    chunks = [f"{key}={counts[key]}" for key in order if counts.get(key)]
+    for key in sorted(set(counts) - set(order)):
+        chunks.append(f"{key}={counts[key]}")
+    return ", ".join(chunks) if chunks else "нет детализации"
+
+
+def _best_signal(payload: dict[str, Any]) -> dict[str, Any] | None:
+    gdelt = payload.get("gdelt") or []
+    news = payload.get("news") or []
+    if gdelt:
+        return {"source": "GDELT", **gdelt[0]}
+    if news:
+        return {"source": "Telegram/RSS", "name": news[0].get("title"), "score": news[0].get("score", news[0].get("risk_score", 0)), "url": news[0].get("link"), **news[0]}
+    kev = payload.get("kev") or []
+    if kev:
+        return {"source": "CISA KEV", "name": kev[0].get("id"), "score": 0, **kev[0]}
+    return None
+
+
+def _signal_line(prefix: str, item: dict[str, Any]) -> str:
+    title = _clip(item.get("name") or item.get("title") or item.get("id") or "untitled", 95)
+    score = item.get("score", item.get("risk_score", 0))
+    category = item.get("type") or item.get("source") or item.get("vendor") or "event"
+    url = item.get("url") or item.get("link") or ""
+    return f"- [{prefix}] score {score} | {category} | {title} | {_clip(url, 90)}".rstrip()
 
 
 def crypto_risk_warnings(query: str) -> list[dict[str, str]]:
@@ -1052,52 +1113,75 @@ def collect_address_analysis(query: str, base_url: str = DEFAULT_BASE_URL, chain
 
 
 def format_radar_text(payload: dict[str, Any]) -> str:
-    parts = ["## OSINT/Risk radar", _line("base", payload.get("base_url", "n/a")), _line("time", payload.get("timestamp", "n/a"))]
+    parts = ["OSINT / Risk radar", _line("time", payload.get("timestamp", "n/a")), _line("base", payload.get("base_url", "n/a"))]
     health = payload.get("health", {})
-    parts.append(_line("health", health.get("status") if health.get("ok") else f"FAIL {health.get('error', '')}"))
-
-    parts.append("\n### GDELT market/geopolitics")
     gdelt_meta = payload.get("gdelt_meta") or {}
-    if gdelt_meta:
-        parts.append(_line("source", gdelt_meta.get("source") or "unknown"))
-        parts.append(_line("raw_total", gdelt_meta.get("total", 0)))
-        if not gdelt_meta.get("total"):
-            parts.append("- status: GDELT DEGRADED — do not rely on this section as complete")
-        elif gdelt_meta.get("errors"):
-            parts.append("- status: GDELT PARTIAL — ranked events are usable, but upstream coverage is incomplete")
-        if gdelt_meta.get("errors"):
-            parts.append(_line("upstream_errors", "; ".join(map(str, gdelt_meta.get("errors", [])))))
+    gdelt_total = int(gdelt_meta.get("total") or 0)
+    gdelt_errors = gdelt_meta.get("errors") or []
+    quality = _quality_label(gdelt_meta)
+    best = _best_signal(payload)
+    best_text = _clip((best or {}).get("name") or (best or {}).get("title") or (best or {}).get("id") or "значимых сигналов нет", 95)
+    health_text = health.get("status") if health.get("ok") else f"FAIL {_clip(health.get('error', ''), 90)}"
+    parts.append(_line("health", health_text))
+
+    parts.append("\nTL;DR")
+    parts.append(f"1) OSIRIS {'живой' if health.get('ok') else 'недоступен'}; GDELT status: {quality}.")
+    source_mode = gdelt_meta.get("source_mode") or "unknown"
+    gdelt_scope = "fallback-срез" if source_mode == "fallback_only" else "GDELT-срез"
+    parts.append(f"2) Рабочий {gdelt_scope}: {gdelt_total} событий; mode={source_mode}.")
+    parts.append(f"3) Главный сигнал сейчас: {best_text}.")
+
+    parts.append("\nИсточники и качество данных")
+    parts.append(f"- GDELT: {quality}; raw_total={gdelt_total}; source={gdelt_meta.get('source') or 'unknown'}")
+    parts.append(f"- GDELT upstream: {_upstream_summary(gdelt_meta.get('upstream_status') or {})}; 429_hits={gdelt_meta.get('rate_limit_hits', 0)}; timeout_hits={gdelt_meta.get('timeout_hits', 0)}")
+    if gdelt_meta.get("circuit_open_until"):
+        parts.append(f"- circuit breaker открыт до {gdelt_meta.get('circuit_open_until')}")
+    if gdelt_errors:
+        parts.append("- upstream_errors: " + "; ".join(_clip(err, 80) for err in gdelt_errors[:4]))
+    parts.append(f"- Telegram/RSS: {len(payload.get('news') or [])} ранжированных сигналов")
+    parts.append(f"- CISA KEV: {len(payload.get('kev') or [])} свежих CVE/KEV")
+
+    parts.append("\nСводка сигналов")
     gdelt = payload.get("gdelt") or []
+    gdelt_prefix = "Fallback" if gdelt_meta.get("fallback") or source_mode == "fallback_only" else "GDELT"
     if not gdelt:
-        parts.append("- no ranked GDELT events returned")
-    for item in gdelt[:8]:
-        name = item.get("name") or item.get("title") or "untitled"
-        url = item.get("url") or ""
-        kws = ",".join(item.get("matched_keywords") or []) or "no-keyword-match"
-        parts.append(f"- score {item.get('score', 0)} | {item.get('type', 'event')} | {name} | {kws} | {url}")
+        parts.append(f"- [{gdelt_prefix}] нет ранжированных событий")
+    for item in gdelt[:5]:
+        parts.append(_signal_line(gdelt_prefix, item))
 
-    parts.append("\n### Telegram/RSS public preview")
     news = payload.get("news") or []
-    if not news:
-        parts.append("- no ranked public-preview/RSS items returned")
-    for item in news[:8]:
-        title = item.get("title") or "untitled"
-        link = item.get("link") or ""
-        src = item.get("source") or "unknown"
-        parts.append(f"- score {item.get('score', item.get('risk_score', 0))} | {src} | {title} | {link}")
+    if source_mode == "fallback_only":
+        parts.append("- [Telegram/RSS] уже используется как fallback для GDELT")
+    else:
+        for item in news[:3]:
+            parts.append(_signal_line("Telegram/RSS", item))
 
-    parts.append("\n### CISA KEV / CVE")
     kev = payload.get("kev") or []
-    if not kev:
-        parts.append("- no recent KEV items returned")
-    for item in kev[:8]:
-        parts.append(f"- {item.get('id')} | {item.get('vendor')} {item.get('product')} | added {item.get('date')} | due {item.get('due')}")
+    for item in kev[:3]:
+        parts.append(f"- [CISA KEV] {item.get('id')} | {item.get('vendor')} {item.get('product')} | added {item.get('date')}")
+
+    partial = quality != "GDELT OK"
+    parts.append("\nРежим принятия решения")
+    parts.append("- Торг: нет, пока сигнал не прошел кросс-чек вне GDELT.")
+    parts.append(f"- Ожидание: {'да' if partial else 'умеренно'}; повторить сбор через {'10-20' if partial else '30-60'} минут.")
+    parts.append("- Смотреть: да; приоритет - energy/geopolitics, sanctions, crypto/cyber, CVE.")
+
+    parts.append("\nСледующий шаг и вывод")
+    if partial:
+        parts.append("1) Повторить radar после паузы, не разгоняя GDELT частыми запросами.")
+        parts.append("2) Подтвердить топ-сигналы через Telegram/RSS или первоисточник.")
+        verdict = "Ожидание с активной верификацией"
+    else:
+        parts.append("1) Держать текущий срез как рабочий baseline.")
+        parts.append("2) Перепроверять только сигналы с высоким score или прямым market impact.")
+        verdict = "Рабочее наблюдение"
 
     errors = {k: v for k, v in payload.items() if k.endswith("_error") and v}
     if errors:
-        parts.append("\n### Adapter errors")
+        parts.append("\nОшибки адаптеров")
         for key, val in errors.items():
-            parts.append(f"- {key}: {val}")
+            parts.append(f"- {key}: {_clip(val, 120)}")
+    parts.append(f"\nВердикт: режим - {verdict}.")
     return "\n".join(parts)
 
 

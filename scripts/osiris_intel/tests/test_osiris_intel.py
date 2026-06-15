@@ -32,7 +32,10 @@ class OsirisIntelTests(unittest.TestCase):
             "kev": [{"id": "CVE-2026-0001", "vendor": "OpenSSH", "product": "Server", "date": "2026-06-01"}],
         }
         text = osiris_intel.format_radar_text(payload)
-        self.assertIn("OSINT/Risk radar", text)
+        self.assertIn("OSINT / Risk radar", text)
+        self.assertIn("TL;DR", text)
+        self.assertIn("Источники и качество данных", text)
+        self.assertIn("Режим принятия решения", text)
         self.assertIn("GDELT", text)
         self.assertIn("https://example.test/g", text)
         self.assertIn("CVE-2026-0001", text)
@@ -48,6 +51,7 @@ class OsirisIntelTests(unittest.TestCase):
         text = osiris_intel.format_radar_text(payload)
         self.assertIn("GDELT DEGRADED", text)
         self.assertIn("GDELT DOC HTTP 429", text)
+        self.assertIn("Ожидание с активной верификацией", text)
 
     def test_rank_news_filters_stale_published_items(self):
         recent = datetime.now(timezone.utc).isoformat()

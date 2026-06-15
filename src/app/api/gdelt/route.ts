@@ -12,6 +12,14 @@ export const dynamic = 'force-dynamic';
  */
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
+const STALE_CACHE_TTL_MS = 30 * 60 * 1000;
+const CIRCUIT_OPEN_MS = 2 * 60 * 1000;
+const GDELT_TIMEOUT_MS = 3_500;
+const GDELT_MAX_ATTEMPTS = 2;
+const GDELT_QUERY_DELAY_MS = 250;
+const GDELT_MAX_RATE_LIMITS = 2;
+const GDELT_MAX_TIMEOUTS = 3;
+const GDELT_REQUEST_DEADLINE_MS = 18_000;
 const GDELT_QUERIES = [
   'bitcoin',
   'crypto',
@@ -38,6 +46,11 @@ const KEYWORD_COORDS: Record<string, [number, number]> = {
 };
 
 let cache: { ts: number; payload: any } | null = null;
+let circuitOpenUntil = 0;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function coordsFor(text: string): [number, number] | null {
   const lower = text.toLowerCase();
@@ -55,6 +68,13 @@ function typeFor(text: string): string {
   return 'geopolitical';
 }
 
+function isRecent(value: string, maxAgeHours = 72) {
+  if (!value) return true;
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return true;
+  return Date.now() - ts <= maxAgeHours * 60 * 60 * 1000;
+}
+
 async function fetchNewsFallback(maxrecords = 20) {
   const baseUrl = process.env.OSIRIS_BASE_URL || 'http://127.0.0.1:3030';
   const url = `${baseUrl.replace(/\/$/, '')}/api/news`;
@@ -65,7 +85,7 @@ async function fetchNewsFallback(maxrecords = 20) {
   });
   if (!res.ok) throw new Error(`OSIRIS news fallback HTTP ${res.status}`);
   const data = await res.json();
-  return (data.news || []).slice(0, maxrecords).map((item: any, idx: number) => {
+  return (data.news || []).filter((item: any) => isRecent(String(item.published || item.published_date || ''))).slice(0, maxrecords).map((item: any, idx: number) => {
     const title = item.title || item.description || 'OSIRIS news event';
     const coords = Array.isArray(item.coords) && item.coords.length >= 2 ? item.coords : coordsFor(`${title} ${item.description || ''}`);
     const type = typeFor(`${title} ${item.description || ''}`);
@@ -100,7 +120,7 @@ async function fetchDocEvents(query: string, maxrecords = 8) {
   url.searchParams.set('sort', 'datedesc');
 
   const res = await fetch(url.toString(), {
-    signal: AbortSignal.timeout(6_000),
+    signal: AbortSignal.timeout(GDELT_TIMEOUT_MS),
     headers: { Accept: 'application/json', 'User-Agent': 'Hermes-OSIRIS-GDELT/1.0' },
     cache: 'no-store',
   });
@@ -136,35 +156,103 @@ async function fetchDocEvents(query: string, maxrecords = 8) {
   });
 }
 
+async function fetchDocEventsWithRetry(query: string, maxrecords = 8) {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < GDELT_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await fetchDocEvents(query, maxrecords);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      const isRateLimit = lastError.message.includes('HTTP 429');
+      const isRetryable = isRateLimit || /HTTP 5\d\d/.test(lastError.message);
+      if (!isRetryable || attempt === GDELT_MAX_ATTEMPTS - 1) break;
+      const backoff = isRateLimit ? 1_500 + Math.floor(Math.random() * 700) : 500 + Math.floor(Math.random() * 500);
+      await sleep(backoff);
+    }
+  }
+  throw lastError || new Error(`GDELT fetch failed for ${query}`);
+}
+
+function staleCachePayload(errors: string[]) {
+  if (!cache || Date.now() - cache.ts > STALE_CACHE_TTL_MS) return null;
+  return {
+    ...cache.payload,
+    stale: true,
+    source_mode: 'stale_cache',
+    timestamp: new Date().toISOString(),
+    errors,
+  };
+}
+
 export async function GET() {
   if (cache && Date.now() - cache.ts < CACHE_TTL_MS) {
-    return NextResponse.json(cache.payload, {
+    return NextResponse.json({
+      ...cache.payload,
+      source_mode: cache.payload.source_mode || 'cache_fresh',
+    }, {
       headers: { 'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=600' },
     });
   }
 
   const allEvents: any[] = [];
   const errors: string[] = [];
+  const upstreamStatus: Record<string, string> = {};
   const seen = new Set<string>();
+  let rateLimitHits = 0;
+  let timeoutHits = 0;
+  let stoppedEarly = false;
+  const deadline = Date.now() + GDELT_REQUEST_DEADLINE_MS;
 
   try {
-    const settled = await Promise.allSettled(GDELT_QUERIES.map((query) => fetchDocEvents(query)));
-    for (let idx = 0; idx < settled.length; idx += 1) {
-      const query = GDELT_QUERIES[idx];
-      const result = settled[idx];
-      if (result.status === 'rejected') {
-        const reason = result.reason;
-        errors.push(`${query}: ${reason instanceof Error ? reason.message : String(reason)}`);
-        continue;
+    if (Date.now() < circuitOpenUntil) {
+      const cached = staleCachePayload([`GDELT circuit open until ${new Date(circuitOpenUntil).toISOString()}`]);
+      if (cached) {
+        return NextResponse.json(cached, {
+          headers: { 'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300' },
+          status: 200,
+        });
       }
-      for (const event of result.value) {
-        const key = event.url || `${event.name}:${event.seendate}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        allEvents.push(event);
-        if (allEvents.length >= 30) break;
+    }
+
+    for (const query of GDELT_QUERIES) {
+      if (Date.now() > deadline) {
+        stoppedEarly = true;
+        errors.push(`deadline: GDELT request exceeded ${GDELT_REQUEST_DEADLINE_MS}ms`);
+        break;
+      }
+      try {
+        const events = await fetchDocEventsWithRetry(query);
+        upstreamStatus[query] = 'ok';
+        for (const event of events) {
+          const key = event.url || `${event.name}:${event.seendate}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          allEvents.push(event);
+          if (allEvents.length >= 30) break;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes('HTTP 429')) {
+          upstreamStatus[query] = 'rate_limited';
+          rateLimitHits += 1;
+        } else if (message.includes('timed out') || message.includes('aborted')) {
+          upstreamStatus[query] = 'timeout';
+          timeoutHits += 1;
+        } else {
+          upstreamStatus[query] = 'error';
+        }
+        errors.push(`${query}: ${message}`);
+        if (rateLimitHits >= GDELT_MAX_RATE_LIMITS || timeoutHits >= GDELT_MAX_TIMEOUTS) {
+          circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
+          stoppedEarly = true;
+          break;
+        }
       }
       if (allEvents.length >= 30) break;
+      await sleep(GDELT_QUERY_DELAY_MS);
+    }
+    for (const query of GDELT_QUERIES) {
+      if (!upstreamStatus[query]) upstreamStatus[query] = stoppedEarly ? 'skipped_circuit' : 'skipped';
     }
   } catch (error) {
     errors.push(error instanceof Error ? error.message : String(error));
@@ -186,17 +274,17 @@ export async function GET() {
     }
   }
 
-  if (errors.length > 0 && cache) {
-    return NextResponse.json({
-      ...cache.payload,
-      stale: true,
-      timestamp: new Date().toISOString(),
-      errors,
-    }, {
-      headers: { 'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300' },
-      status: 200,
-    });
+  if (allEvents.length === 0 && errors.length > 0) {
+    const cached = staleCachePayload(errors);
+    if (cached) {
+      return NextResponse.json(cached, {
+        headers: { 'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300' },
+        status: 200,
+      });
+    }
   }
+
+  const sourceMode = fallback ? 'fallback_only' : errors.length > 0 ? 'gdelt_partial' : 'gdelt_only';
 
   const payload = {
     events: allEvents,
@@ -206,6 +294,11 @@ export async function GET() {
     errors,
     partial: errors.length > 0 && allEvents.length > 0,
     fallback,
+    source_mode: sourceMode,
+    upstream_status: upstreamStatus,
+    rate_limit_hits: rateLimitHits,
+    timeout_hits: timeoutHits,
+    circuit_open_until: circuitOpenUntil > Date.now() ? new Date(circuitOpenUntil).toISOString() : null,
   };
   if (allEvents.length > 0) {
     cache = { ts: Date.now(), payload };
