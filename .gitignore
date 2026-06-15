@@ -34,6 +34,10 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
+# Python local tooling
+__pycache__/
+*.py[cod]
+
 # Scanner backend (API key in env, not in git)
 scanner/
 .vercel
