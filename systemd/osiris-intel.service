@@ -1,0 +1,17 @@
+[Unit]
+Description=OSIRIS intelligence layer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/labs/osiris/intel
+Environment=NODE_ENV=production
+Environment=INTEL_HOST=127.0.0.1
+Environment=INTEL_PORT=4000
+ExecStart=/usr/bin/node /root/labs/osiris/intel/server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

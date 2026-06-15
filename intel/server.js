@@ -18,6 +18,7 @@
 const express = require('express');
 const app = express();
 const PORT = process.env.INTEL_PORT || 4000;
+const HOST = process.env.INTEL_HOST || '0.0.0.0';
 
 // ════════════════════════════════════════════════════
 // §1 — CONFIGURATION
@@ -766,8 +767,8 @@ async function boot() {
   // Refresh sanctions every 24h
   setInterval(() => loadSanctions(), SDN_REFRESH_MS);
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[INTEL] Intelligence Layer ready on port ${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`[INTEL] Intelligence Layer ready on ${HOST}:${PORT}`);
     console.log(`[INTEL] Sanctions: ${sanctionsIndex.entries.length} entities indexed`);
     console.log(`[INTEL] Resolve endpoint: GET /resolve?type=<type>&id=<id>`);
   });

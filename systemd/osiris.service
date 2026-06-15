@@ -1,0 +1,19 @@
+[Unit]
+Description=OSIRIS local OSINT dashboard
+After=network-online.target osiris-intel.service
+Wants=network-online.target osiris-intel.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/labs/osiris
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3030
+Environment=INTEL_URL=http://127.0.0.1:4000
+ExecStart=/usr/bin/node /root/labs/osiris/.next/standalone/server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
